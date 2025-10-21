@@ -30,14 +30,16 @@ def parse_log_file(log_file_path):
         r'workgroup=\[(\d+),\s*(\d+),\s*(\d+)\],\s*'
         r'private_seg_size=(\d+),\s*'
         r'group_seg_size=(\d+),.*?'
-        r'completion_signal=(0x[0-9a-f]+)'
+        r'completion_signal=(0x[0-9a-f]+).*?'
+        r'rptr=(\d+),\s*wptr=(\d+)'
     )
     barrier_pattern = re.compile(
         r':4:(?:[a-z]+\.cpp)?\s*:\d+\s*:\s*(\d+)\s+us:.*?'
         r'SWq=(0x[0-9a-f]+),\s*HWq=(0x[0-9a-f]+),\s*id=(\d+),\s*'
         r'Barrier(?:AND|Value) Header.*?'
         r'\(type=\d+,\s*barrier=\d+,\s*acquire=(\d+),\s*release=(\d+)\).*?'
-        r'completion_signal=(0x[0-9a-f]+)'
+        r'completion_signal=(0x[0-9a-f]+).*?'
+        r'rptr=(\d+),\s*wptr=(\d+)'
     )
     copy_pattern = re.compile(
         r':4:(?:[a-z]+\.cpp)?\s*:\d+\s*:\s*(\d+)\s+us:.*?'
@@ -92,6 +94,8 @@ def parse_log_file(log_file_path):
                 private_seg_size = dispatch_match.group(14)
                 group_seg_size = dispatch_match.group(15)
                 completion_signal = dispatch_match.group(16)
+                rptr = dispatch_match.group(17)
+                wptr = dispatch_match.group(18)
 
                 packets.append({
                     'type': 'Dispatch',
@@ -108,6 +112,8 @@ def parse_log_file(log_file_path):
                     'private_seg_size': private_seg_size,
                     'group_seg_size': group_seg_size,
                     'completion_signal': completion_signal,
+                    'rptr': rptr,
+                    'wptr': wptr,
                     'shader': current_shader,
                     'pid': pid
                 })
@@ -123,6 +129,8 @@ def parse_log_file(log_file_path):
                 acquire = barrier_match.group(5)
                 release = barrier_match.group(6)
                 completion_signal = barrier_match.group(7)
+                rptr = barrier_match.group(8)
+                wptr = barrier_match.group(9)
 
                 packets.append({
                     'type': 'Barrier',
@@ -134,6 +142,8 @@ def parse_log_file(log_file_path):
                     'acquire': acquire,
                     'release': release,
                     'completion_signal': completion_signal,
+                    'rptr': rptr,
+                    'wptr': wptr,
                     'shader': None,
                     'pid': pid
                 })
@@ -312,7 +322,9 @@ def generate_perfetto_json(packets, output_file):
                 'grid': packet['grid'],
                 'workgroup': packet['workgroup'],
                 'private_seg_size': packet['private_seg_size'],
-                'group_seg_size': packet['group_seg_size']
+                'group_seg_size': packet['group_seg_size'],
+                'rptr': packet['rptr'],
+                'wptr': packet['wptr']
             })
             if packet['shader']:
                 event['args']['shader'] = packet['shader']
@@ -322,7 +334,9 @@ def generate_perfetto_json(packets, output_file):
                 'hwq': packet['hwq'],
                 'queue_id': packet['queue_id'],
                 'acquire': packet['acquire'],
-                'release': packet['release']
+                'release': packet['release'],
+                'rptr': packet['rptr'],
+                'wptr': packet['wptr']
             })
 
         trace_events.append(event)
