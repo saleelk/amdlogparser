@@ -19,20 +19,28 @@ def parse_log_file(log_file_path):
 
     # Patterns
     shader_pattern = re.compile(r'ShaderName\s*:\s*(.+)')
+    # Make filename optional - look for :4: followed by optional filename or spaces, then line number, timestamp, and pid/tid/SWq
     dispatch_pattern = re.compile(
-        r':4:rocvirtual\.cpp\s+:\d+:\s+(\d+)\s+us:.*?'
+        r':4:(?:[a-z]+\.cpp)?\s*:\d+\s*:\s*(\d+)\s+us:.*?'
         r'SWq=(0x[0-9a-f]+),\s*HWq=(0x[0-9a-f]+),\s*id=(\d+),\s*'
         r'Dispatch Header.*?'
+        r'\(type=\d+,\s*barrier=\d+,\s*acquire=(\d+),\s*release=(\d+)\),\s*'
+        r'setup=(\d+),\s*'
+        r'grid=\[(\d+),\s*(\d+),\s*(\d+)\],\s*'
+        r'workgroup=\[(\d+),\s*(\d+),\s*(\d+)\],\s*'
+        r'private_seg_size=(\d+),\s*'
+        r'group_seg_size=(\d+),.*?'
         r'completion_signal=(0x[0-9a-f]+)'
     )
     barrier_pattern = re.compile(
-        r':4:rocvirtual\.cpp\s+:\d+:\s+(\d+)\s+us:.*?'
+        r':4:(?:[a-z]+\.cpp)?\s*:\d+\s*:\s*(\d+)\s+us:.*?'
         r'SWq=(0x[0-9a-f]+),\s*HWq=(0x[0-9a-f]+),\s*id=(\d+),\s*'
-        r'BarrierAND Header.*?'
+        r'Barrier(?:AND|Value) Header.*?'
+        r'\(type=\d+,\s*barrier=\d+,\s*acquire=(\d+),\s*release=(\d+)\).*?'
         r'completion_signal=(0x[0-9a-f]+)'
     )
     copy_pattern = re.compile(
-        r':4:rocblit\.cpp\s+:\d+:\s+(\d+)\s+us:.*?'
+        r':4:(?:[a-z]+\.cpp)?\s*:\d+\s*:\s*(\d+)\s+us:.*?'
         r'HSA Copy copy_engine=(0x[0-9a-f]+),\s*'
         r'dst=(0x[0-9a-f]+),\s*src=(0x[0-9a-f]+),\s*size=(\d+).*?'
         r'completion_signal=(0x[0-9a-f]+)'
@@ -72,7 +80,18 @@ def parse_log_file(log_file_path):
                 swq = dispatch_match.group(2)
                 hwq = dispatch_match.group(3)
                 queue_id = dispatch_match.group(4)
-                completion_signal = dispatch_match.group(5)
+                acquire = dispatch_match.group(5)
+                release = dispatch_match.group(6)
+                setup = dispatch_match.group(7)
+                grid_x = dispatch_match.group(8)
+                grid_y = dispatch_match.group(9)
+                grid_z = dispatch_match.group(10)
+                workgroup_x = dispatch_match.group(11)
+                workgroup_y = dispatch_match.group(12)
+                workgroup_z = dispatch_match.group(13)
+                private_seg_size = dispatch_match.group(14)
+                group_seg_size = dispatch_match.group(15)
+                completion_signal = dispatch_match.group(16)
 
                 packets.append({
                     'type': 'Dispatch',
@@ -81,6 +100,13 @@ def parse_log_file(log_file_path):
                     'swq': swq,
                     'hwq': hwq,
                     'queue_id': queue_id,
+                    'acquire': acquire,
+                    'release': release,
+                    'setup': setup,
+                    'grid': [grid_x, grid_y, grid_z],
+                    'workgroup': [workgroup_x, workgroup_y, workgroup_z],
+                    'private_seg_size': private_seg_size,
+                    'group_seg_size': group_seg_size,
                     'completion_signal': completion_signal,
                     'shader': current_shader,
                     'pid': pid
@@ -94,7 +120,9 @@ def parse_log_file(log_file_path):
                 swq = barrier_match.group(2)
                 hwq = barrier_match.group(3)
                 queue_id = barrier_match.group(4)
-                completion_signal = barrier_match.group(5)
+                acquire = barrier_match.group(5)
+                release = barrier_match.group(6)
+                completion_signal = barrier_match.group(7)
 
                 packets.append({
                     'type': 'Barrier',
@@ -103,6 +131,8 @@ def parse_log_file(log_file_path):
                     'swq': swq,
                     'hwq': hwq,
                     'queue_id': queue_id,
+                    'acquire': acquire,
+                    'release': release,
                     'completion_signal': completion_signal,
                     'shader': None,
                     'pid': pid
@@ -258,6 +288,7 @@ def generate_perfetto_json(packets, output_file):
             'pid': int(packet['pid']),
             'tid': tid,
             'args': {
+                'log_timestamp_us': packet['timestamp_us'],
                 'completion_signal': packet['completion_signal'],
             }
         }
@@ -270,14 +301,29 @@ def generate_perfetto_json(packets, output_file):
                 'src': packet['src'],
                 'size': packet['size']
             })
-        else:
+        elif packet['type'] == 'Dispatch':
             event['args'].update({
                 'swq': packet['swq'],
                 'hwq': packet['hwq'],
-                'queue_id': packet['queue_id']
+                'queue_id': packet['queue_id'],
+                'acquire': packet['acquire'],
+                'release': packet['release'],
+                'setup': packet['setup'],
+                'grid': packet['grid'],
+                'workgroup': packet['workgroup'],
+                'private_seg_size': packet['private_seg_size'],
+                'group_seg_size': packet['group_seg_size']
             })
             if packet['shader']:
                 event['args']['shader'] = packet['shader']
+        elif packet['type'] == 'Barrier':
+            event['args'].update({
+                'swq': packet['swq'],
+                'hwq': packet['hwq'],
+                'queue_id': packet['queue_id'],
+                'acquire': packet['acquire'],
+                'release': packet['release']
+            })
 
         trace_events.append(event)
 
