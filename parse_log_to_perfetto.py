@@ -18,10 +18,11 @@ def parse_log_file(log_file_path):
     current_shader = None
 
     # Patterns
-    shader_pattern = re.compile(r'ShaderName\s*:\s*(.+)')
-    # Make filename optional - look for :4: followed by optional filename or spaces, then line number, timestamp, and pid/tid/SWq
+    # Support both "ShaderName" and "Graph shader name" formats
+    shader_pattern = re.compile(r'(?:Graph\s+)?(?:shader name|ShaderName)\s*:\s*([^,\n]+)')
+    # Make filename optional - look for :4: or :5: followed by optional filename or spaces, then timestamp
     dispatch_pattern = re.compile(
-        r':4:(?:[a-z]+\.cpp)?\s*:\d+\s*:\s*(\d+)\s+us:.*?'
+        r':[45]:(?:[a-z]+\.cpp)?\s*:?\d*\s*:\s*(\d+)\s+us:.*?'
         r'SWq=(0x[0-9a-f]+),\s*HWq=(0x[0-9a-f]+),\s*id=(\d+),\s*'
         r'Dispatch Header.*?'
         r'\(type=\d+,\s*barrier=\d+,\s*acquire=(\d+),\s*release=(\d+)\),\s*'
@@ -34,7 +35,7 @@ def parse_log_file(log_file_path):
         r'rptr=(\d+),\s*wptr=(\d+)'
     )
     barrier_pattern = re.compile(
-        r':4:(?:[a-z]+\.cpp)?\s*:\d+\s*:\s*(\d+)\s+us:.*?'
+        r':[45]:(?:[a-z]+\.cpp)?\s*:?\d*\s*:\s*(\d+)\s+us:.*?'
         r'SWq=(0x[0-9a-f]+),\s*HWq=(0x[0-9a-f]+),\s*id=(\d+),\s*'
         r'Barrier(?:AND|Value) Header.*?'
         r'\(type=\d+,\s*barrier=\d+,\s*acquire=(\d+),\s*release=(\d+)\).*?'
@@ -42,7 +43,7 @@ def parse_log_file(log_file_path):
         r'rptr=(\d+),\s*wptr=(\d+)'
     )
     copy_pattern = re.compile(
-        r':4:(?:[a-z]+\.cpp)?\s*:\d+\s*:\s*(\d+)\s+us:.*?'
+        r':[45]:(?:[a-z]+\.cpp)?\s*:?\d*\s*:\s*(\d+)\s+us:.*?'
         r'HSA Copy copy_engine=(0x[0-9a-f]+),\s*'
         r'dst=(0x[0-9a-f]+),\s*src=(0x[0-9a-f]+),\s*size=(\d+).*?'
         r'completion_signal=(0x[0-9a-f]+)'
@@ -374,13 +375,22 @@ def generate_perfetto_json(packets, output_file):
 
 def main():
     import sys
+    import os
 
     if len(sys.argv) < 2:
         print("Usage: python parse_log_to_perfetto.py <log_file> [output_file]")
         sys.exit(1)
 
     log_file = sys.argv[1]
-    output_file = sys.argv[2] if len(sys.argv) > 2 else 'perfetto_trace.json'
+
+    # Generate default output filename based on input filename
+    if len(sys.argv) > 2:
+        output_file = sys.argv[2]
+    else:
+        input_basename = os.path.basename(log_file)
+        # Remove extension if present
+        input_name = os.path.splitext(input_basename)[0]
+        output_file = f'perfetto_json_{input_name}.json'
 
     # Parse the log file
     packets, signals = parse_log_file(log_file)
