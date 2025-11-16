@@ -3,7 +3,7 @@
 Analyze HIP/ROCm log file to extract queue information:
 - Queue creation (hipStreamCreate, hipStreamCreateWithFlags)
 - Queue priorities
-- SWq to HWq mappings
+- Stream to HWq mappings
 
 Author: Saleel Kudchadker
 """
@@ -16,11 +16,15 @@ def analyze_log_file(log_file_path):
 
     # Data structures
     stream_creates = []
-    swq_hwq_mappings = {}
+    stream_destroys = []
+    stream_hwq_mappings = {}  # Map stream addresses to HWq addresses
     queue_priorities = {}
-    all_swqs = set()
+    all_streams = set()
     all_hwqs = set()
     queue_info = {}
+
+    # Track in-progress stream creations by thread ID
+    pending_stream_creation = {}
 
     # Patterns
     stream_create_basic_pattern = re.compile(
@@ -47,6 +51,11 @@ def analyze_log_file(log_file_path):
         r'hipStreamCreateWithPriority:\s*Returned\s+\w+\s*:\s*stream:(0x[0-9a-f]+)'
     )
 
+    # Stream destroy pattern
+    stream_destroy_pattern = re.compile(
+        r'hipStreamDestroy\s*\(\s*stream:(0x[0-9a-f]+)\s*\)'
+    )
+
     # Queue priority allocation pattern
     priority_allocation_pattern = re.compile(
         r'Number of allocated hardware queues with low priority:\s*(\d+),\s*'
@@ -59,13 +68,19 @@ def analyze_log_file(log_file_path):
         r'Selected queue.*?:(0x[0-9a-f]+)\s*\((\d+)\)'
     )
 
-    # SWq and HWq pattern
-    swq_hwq_pattern = re.compile(
-        r'SWq=(0x[0-9a-f]+),\s*HWq=(0x[0-9a-f]+)'
+    # HWq creation pattern (from rocdevice.cpp)
+    hwq_create_pattern = re.compile(
+        r':3:rocdevice\.cpp.*?Created SWq=(0x[0-9a-f]+) to map on HWq=(0x[0-9a-f]+)'
     )
 
-    # PID pattern
+    # Selected queue refCount pattern (reusing existing HWq)
+    selected_refcount_pattern = re.compile(
+        r'Selected queue refCount:\s*(0x[0-9a-f]+)'
+    )
+
+    # PID and TID patterns
     pid_pattern = re.compile(r'\[pid:(\d+)')
+    tid_pattern = re.compile(r'tid:\s*(0x[0-9a-f]+)')
 
     print(f"Analyzing log file: {log_file_path}")
     print("This may take a while for large files...\n")
@@ -81,10 +96,13 @@ def analyze_log_file(log_file_path):
             if line_count % 500000 == 0:
                 print(f"Processed {line_count} lines...")
 
-            # Extract PID
+            # Extract PID and TID
             pid_match = pid_pattern.search(line)
             if pid_match:
                 current_pid = pid_match.group(1)
+
+            tid_match = tid_pattern.search(line)
+            tid = tid_match.group(1) if tid_match else None
 
             # Check for priority allocation info
             priority_match = priority_allocation_pattern.search(line)
@@ -94,6 +112,28 @@ def analyze_log_file(log_file_path):
                     'normal': int(priority_match.group(2)),
                     'high': int(priority_match.group(3))
                 }
+
+            # Track stream creation flow to capture stream -> HWq mapping
+            # Step 1: Detect start of stream creation (any variant)
+            if tid and (stream_create_basic_pattern.search(line) or
+                       stream_create_flags_pattern.search(line) or
+                       stream_create_priority_pattern.search(line)):
+                if tid not in pending_stream_creation:
+                    pending_stream_creation[tid] = {}
+
+            # Step 2: Capture HWq assignment (either newly created or selected)
+            if tid and tid in pending_stream_creation:
+                hwq_create_match = hwq_create_pattern.search(line)
+                if hwq_create_match:
+                    hwq = hwq_create_match.group(2)
+                    pending_stream_creation[tid]['hwq'] = hwq
+                    all_hwqs.add(hwq)
+                else:
+                    selected_refcount_match = selected_refcount_pattern.search(line)
+                    if selected_refcount_match:
+                        hwq = selected_refcount_match.group(1)
+                        pending_stream_creation[tid]['hwq'] = hwq
+                        all_hwqs.add(hwq)
 
             # Check for basic stream creation (hipStreamCreate)
             stream_basic_match = stream_create_basic_pattern.search(line)
@@ -173,6 +213,7 @@ def analyze_log_file(log_file_path):
             stream_return_basic_match = stream_return_basic_pattern.search(line)
             if stream_return_basic_match:
                 stream_addr = stream_return_basic_match.group(1)
+                all_streams.add(stream_addr)
                 if last_stream_create_info is not None:
                     queue_info[stream_addr] = {
                         'type': last_stream_create_info.get('type'),
@@ -181,10 +222,17 @@ def analyze_log_file(log_file_path):
                     }
                     last_stream_create_info = None
 
+                # Complete stream -> HWq mapping
+                if tid and tid in pending_stream_creation and 'hwq' in pending_stream_creation[tid]:
+                    hwq = pending_stream_creation[tid]['hwq']
+                    stream_hwq_mappings[(stream_addr, current_pid)] = hwq
+                    del pending_stream_creation[tid]
+
             # Check for stream return (flags version)
             stream_return_flags_match = stream_return_flags_pattern.search(line)
             if stream_return_flags_match:
                 stream_addr = stream_return_flags_match.group(1)
+                all_streams.add(stream_addr)
                 if last_stream_create_info is not None:
                     queue_info[stream_addr] = {
                         'type': last_stream_create_info.get('type'),
@@ -195,10 +243,17 @@ def analyze_log_file(log_file_path):
                     }
                     last_stream_create_info = None
 
+                # Complete stream -> HWq mapping
+                if tid and tid in pending_stream_creation and 'hwq' in pending_stream_creation[tid]:
+                    hwq = pending_stream_creation[tid]['hwq']
+                    stream_hwq_mappings[(stream_addr, current_pid)] = hwq
+                    del pending_stream_creation[tid]
+
             # Check for stream return (priority version)
             stream_return_priority_match = stream_return_priority_pattern.search(line)
             if stream_return_priority_match:
                 stream_addr = stream_return_priority_match.group(1)
+                all_streams.add(stream_addr)
                 if last_stream_create_info is not None:
                     queue_info[stream_addr] = {
                         'type': last_stream_create_info.get('type'),
@@ -209,25 +264,22 @@ def analyze_log_file(log_file_path):
                     }
                     last_stream_create_info = None
 
-            # Check for selected queue
-            selected_match = selected_queue_pattern.search(line)
-            if selected_match:
-                hwq = selected_match.group(1)
-                ref_count = int(selected_match.group(2))
-                all_hwqs.add(hwq)
+                # Complete stream -> HWq mapping
+                if tid and tid in pending_stream_creation and 'hwq' in pending_stream_creation[tid]:
+                    hwq = pending_stream_creation[tid]['hwq']
+                    stream_hwq_mappings[(stream_addr, current_pid)] = hwq
+                    del pending_stream_creation[tid]
 
-            # Extract SWq-HWq mappings
-            swq_hwq_match = swq_hwq_pattern.search(line)
-            if swq_hwq_match:
-                swq = swq_hwq_match.group(1)
-                hwq = swq_hwq_match.group(2)
-                all_swqs.add(swq)
-                all_hwqs.add(hwq)
-
-                # Store mapping with PID
-                key = (swq, current_pid)
-                if key not in swq_hwq_mappings:
-                    swq_hwq_mappings[key] = hwq
+            # Check for stream destroy
+            stream_destroy_match = stream_destroy_pattern.search(line)
+            if stream_destroy_match:
+                stream_addr = stream_destroy_match.group(1)
+                stream_destroys.append({
+                    'line_num': line_count,
+                    'pid': current_pid,
+                    'stream': stream_addr,
+                    'line': line.strip()
+                })
 
     print(f"Processed {line_count} lines total\n")
 
@@ -242,35 +294,14 @@ def analyze_log_file(log_file_path):
     priority_count = len([s for s in stream_creates if s['type'] == 'hipStreamCreateWithPriority'])
 
     print(f"\nTotal Statistics:")
-    print(f"   - Unique Software Queues (SWq): {len(all_swqs)}")
+    print(f"   - Unique Streams: {len(all_streams)}")
     print(f"   - Unique Hardware Queues (HWq): {len(all_hwqs)}")
+    print(f"   - Stream -> HWq mappings found: {len(stream_hwq_mappings)}")
     print(f"   - Stream creation API calls found: {len(stream_creates)}")
     print(f"     * hipStreamCreate: {basic_count}")
     print(f"     * hipStreamCreateWithFlags: {flags_count}")
     print(f"     * hipStreamCreateWithPriority: {priority_count}")
-
-    print(f"\nHardware Queues (HWq):")
-    for i, hwq in enumerate(sorted(all_hwqs), 1):
-        # Count how many SWqs map to this HWq
-        swq_count = sum(1 for (swq, pid), mapped_hwq in swq_hwq_mappings.items() if mapped_hwq == hwq)
-        print(f"   {i}. {hwq} (used by {swq_count} SWq(s))")
-
-    print(f"\nSoftware Queues (SWq):")
-    for i, swq in enumerate(sorted(all_swqs), 1):
-        # Find corresponding HWq
-        hwq_for_swq = None
-        for (s, pid), hwq in swq_hwq_mappings.items():
-            if s == swq:
-                hwq_for_swq = hwq
-                break
-        print(f"   {i}. {swq} -> maps to HWq {hwq_for_swq}")
-
-    print(f"\nSWq -> HWq Mappings:")
-    print(f"   {'SWq':<20} {'PID':<10} {'-> HWq':<20}")
-    print(f"   {'-'*20} {'-'*10} {'-'*20}")
-
-    for (swq, pid), hwq in sorted(swq_hwq_mappings.items()):
-        print(f"   {swq:<20} {pid:<10} -> {hwq:<20}")
+    print(f"   - Stream destroy calls found: {len(stream_destroys)}")
 
     if stream_creates:
         print(f"\nStream Creation Details:")
@@ -304,8 +335,8 @@ def analyze_log_file(log_file_path):
             for (prio_val, prio_name), count in sorted(priority_dist.items()):
                 print(f"       Priority {prio_val} ({prio_name}): {count} streams")
 
-        print(f"\n   First 10 stream creation calls:")
-        for i, stream_info in enumerate(stream_creates[:10], 1):
+        print(f"\n   All stream creation calls:")
+        for i, stream_info in enumerate(stream_creates, 1):
             if stream_info['type'] == 'hipStreamCreate':
                 print(f"      {i}. Line {stream_info['line_num']}: PID {stream_info['pid']}, Type: Basic (no flags)")
             elif stream_info['type'] == 'hipStreamCreateWithFlags':
@@ -313,24 +344,26 @@ def analyze_log_file(log_file_path):
             else:
                 print(f"      {i}. Line {stream_info['line_num']}: PID {stream_info['pid']}, Type: Priority, Priority: {stream_info['priority']} ({stream_info['priority_name']})")
 
-        if len(stream_creates) > 10:
-            print(f"      ... and {len(stream_creates) - 10} more")
+    if stream_destroys:
+        print(f"\n   All stream destroy calls:")
+        for i, destroy_info in enumerate(stream_destroys, 1):
+            print(f"      {i}. Line {destroy_info['line_num']}: PID {destroy_info['pid']}, Stream: {destroy_info['stream']}")
 
     # Group by PID
     print(f"\nQueue Information by Process (PID):")
-    pids = set(pid for (swq, pid) in swq_hwq_mappings.keys())
+    pids = set(pid for (stream, pid) in stream_hwq_mappings.keys())
     for pid in sorted(pids):
-        pid_mappings = [(swq, hwq) for (swq, p), hwq in swq_hwq_mappings.items() if p == pid]
-        pid_swqs = set(swq for swq, hwq in pid_mappings)
-        pid_hwqs = set(hwq for swq, hwq in pid_mappings)
+        pid_mappings = [(stream, hwq) for (stream, p), hwq in stream_hwq_mappings.items() if p == pid]
+        pid_streams = set(stream for stream, hwq in pid_mappings)
+        pid_hwqs = set(hwq for stream, hwq in pid_mappings)
 
         print(f"\n   PID {pid}:")
-        print(f"     - Software Queues: {len(pid_swqs)}")
+        print(f"     - Streams: {len(pid_streams)}")
         print(f"     - Hardware Queues: {len(pid_hwqs)}")
         print(f"     - Mappings:")
 
-        for swq, hwq in sorted(pid_mappings):
-            print(f"       - SWq {swq} -> HWq {hwq}")
+        for stream, hwq in sorted(pid_mappings):
+            print(f"       - Stream {stream} -> HWq {hwq}")
 
     # Check for priority information from the log
     if last_priority_info:
@@ -341,14 +374,27 @@ def analyze_log_file(log_file_path):
     else:
         print(f"\nNo priority allocation information found in log")
 
+    # Hardware Queues summary at the end
+    print(f"\nHardware Queue Usage Summary:")
+    for i, hwq in enumerate(sorted(all_hwqs), 1):
+        # Find all streams that map to this HWq
+        streams_for_hwq = [stream for (stream, pid), mapped_hwq in stream_hwq_mappings.items() if mapped_hwq == hwq]
+        stream_count = len(streams_for_hwq)
+        print(f"   {i}. {hwq} (used by {stream_count} stream(s))")
+        if streams_for_hwq:
+            # Show the streams, sorted
+            streams_sorted = sorted(streams_for_hwq)
+            print(f"      Used by: {', '.join(streams_sorted)}")
+
     print("\n" + "=" * 80)
 
     # Return data for programmatic use
     return {
-        'all_swqs': all_swqs,
+        'all_streams': all_streams,
         'all_hwqs': all_hwqs,
-        'mappings': swq_hwq_mappings,
+        'stream_hwq_mappings': stream_hwq_mappings,
         'stream_creates': stream_creates,
+        'stream_destroys': stream_destroys,
         'queue_info': queue_info
     }
 
